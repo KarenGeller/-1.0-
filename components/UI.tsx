@@ -1,41 +1,69 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useStore } from '../store/useStore';
 
-// Reliable MP3 source from Archive.org
-const MUSIC_URL = "https://archive.org/download/JingleBells_205/Jingle%20Bells.mp3";
+// Reliable Audio Sources
+// 1. Free Music Archive (Kevin MacLeod - Jingle Bells) - MP3
+const PRIMARY_MUSIC_URL = "https://files.freemusicarchive.org/storage-freemusicarchive-org/music/no_curator/Kevin_MacLeod/Jazz_Sampler/Kevin_MacLeod_-_Jingle_Bells.mp3";
+// 2. Archive.org (Standard MP3) - Fallback
+const BACKUP_MUSIC_URL = "https://ia800508.us.archive.org/15/items/JingleBells_205/Jingle%20Bells.mp3";
+// 3. Wikimedia (Instrumental OGG) - Good fallback for Chrome/Firefox
+const TERTIARY_MUSIC_URL = "https://upload.wikimedia.org/wikipedia/commons/e/e9/Jingle_Bells_%28Instrumental%29.ogg";
 
 const UI: React.FC = () => {
-  const { currentMusic, phase, gestureState, addUploadedPhotos } = useStore();
+  const { currentMusic, phase, gestureState, theme, setTheme, setAudioData, addUploadedPhotos } = useStore();
   const [isPlaying, setIsPlaying] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  
+  // Audio Analysis Refs
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const rafRef = useRef<number>(0);
 
   useEffect(() => {
     const audio = new Audio();
-    // No crossOrigin needed for simple playback
-    audio.src = MUSIC_URL;
+    // Default to anonymous to allow analysis if possible
+    audio.crossOrigin = "anonymous"; 
     audio.loop = true;
+    audio.src = PRIMARY_MUSIC_URL;
+    audio.preload = "auto";
     audio.volume = 0.5;
-    audio.preload = 'auto';
+    
+    // State to track fallback attempts
+    let attempt = 0;
 
     const handleError = (e: Event) => {
-      const target = e.target as HTMLAudioElement;
-      let errorMessage = "Unknown audio error";
-      const err = target.error;
-      
-      if (err) {
-        switch (err.code) {
-          case err.MEDIA_ERR_ABORTED: errorMessage = "Fetch aborted"; break;
-          case err.MEDIA_ERR_NETWORK: errorMessage = "Network error"; break;
-          case err.MEDIA_ERR_DECODE: errorMessage = "Decode error"; break;
-          case err.MEDIA_ERR_SRC_NOT_SUPPORTED: errorMessage = "Source not supported (404 or Format)"; break;
-          default: errorMessage = `Code: ${err.code}`;
+        const target = e.target as HTMLAudioElement;
+        const err = target.error;
+        console.warn(`Audio load error (Attempt ${attempt}):`, err?.code, err?.message);
+        attempt++;
+
+        if (attempt === 1) {
+            // Fallback 1: Backup Source (Archive.org)
+            console.log("Switching to backup source (Archive.org)...");
+            audio.src = BACKUP_MUSIC_URL;
+            audio.load();
+        } else if (attempt === 2) {
+            // Fallback 2: Tertiary (Wikimedia OGG)
+            console.log("Switching to tertiary source (Wikimedia OGG)...");
+            audio.src = TERTIARY_MUSIC_URL;
+            audio.load();
+        } else if (attempt === 3) {
+            // Fallback 3: Try Primary again WITHOUT CORS (Visualizer unavailable)
+            console.log("Disabling CORS and retrying Primary...");
+            audio.removeAttribute('crossOrigin');
+            audio.src = PRIMARY_MUSIC_URL;
+            audio.load();
+        } else if (attempt === 4) {
+             // Fallback 4: Try Backup WITHOUT CORS
+             console.log("Disabling CORS and retrying Backup...");
+             audio.removeAttribute('crossOrigin');
+             audio.src = BACKUP_MUSIC_URL;
+             audio.load();
+        } else {
+             console.error("All audio fallbacks failed. Please check your network connection.");
         }
-        if (err.message) errorMessage += ` - ${err.message}`;
-      }
-      
-      console.error(`Audio Playback Error: ${errorMessage}`, target.src);
-      setIsPlaying(false);
     };
 
     audio.addEventListener('error', handleError);
@@ -45,30 +73,94 @@ const UI: React.FC = () => {
         audio.removeEventListener('error', handleError);
         audio.pause();
         audioRef.current = null;
+        if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+            audioContextRef.current.close();
+        }
     };
   }, []);
 
-  const toggleMusic = () => {
+  const setupAudioContext = () => {
+      if (!audioRef.current || audioContextRef.current) return;
+      
+      // If CORS was disabled during fallback, we cannot use AudioContext on the element
+      if (!audioRef.current.crossOrigin) {
+          console.warn("CORS is disabled for this audio source. Visualization unavailable.");
+          return;
+      }
+
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioContext();
+      audioContextRef.current = ctx;
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      analyserRef.current = analyser;
+
+      try {
+        const source = ctx.createMediaElementSource(audioRef.current);
+        sourceRef.current = source;
+        source.connect(analyser);
+        analyser.connect(ctx.destination);
+      } catch (err) {
+        console.warn("Visualizer setup failed (likely CORS). Audio will still play.", err);
+      }
+  };
+
+  const analyzeAudio = () => {
+      if (!analyserRef.current) {
+          // Fallback simulation if visualizer failed
+          if (isPlaying) {
+             // Simple simulated beat
+             const time = Date.now() / 1000;
+             const beat = (Math.sin(time * 10) + 1) / 2 * 0.5;
+             setAudioData(beat);
+             rafRef.current = requestAnimationFrame(analyzeAudio);
+          }
+          return;
+      }
+
+      const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+      analyserRef.current.getByteFrequencyData(dataArray);
+      
+      // Calculate average bass (lower frequencies)
+      let sum = 0;
+      const bassBinCount = 10; 
+      for (let i = 0; i < bassBinCount; i++) {
+          sum += dataArray[i];
+      }
+      const avg = sum / bassBinCount; // 0 to 255
+      
+      // Normalize to 0-1 range roughly, but keep it punchy
+      setAudioData(avg / 255.0);
+      
+      rafRef.current = requestAnimationFrame(analyzeAudio);
+  };
+
+  const toggleMusic = async () => {
       if (!audioRef.current) return;
       
       if (isPlaying) {
           audioRef.current.pause();
           setIsPlaying(false);
+          if (rafRef.current) cancelAnimationFrame(rafRef.current);
       } else {
-          // Attempt to reload if in error state
-          if (audioRef.current.error) {
-              console.log("Reloading audio due to previous error...");
-              audioRef.current.load();
-          }
-          
-          const playPromise = audioRef.current.play();
-          if (playPromise !== undefined) {
-              playPromise
-                .then(() => setIsPlaying(true))
-                .catch(err => {
-                    console.error("Play request failed:", err);
-                    setIsPlaying(false);
-                });
+          try {
+            // Setup context on first play
+            if (!audioContextRef.current && audioRef.current.crossOrigin) {
+                setupAudioContext();
+            }
+            if (audioContextRef.current?.state === 'suspended') {
+                await audioContextRef.current.resume();
+            }
+
+            await audioRef.current.play();
+            setIsPlaying(true);
+            analyzeAudio();
+          } catch (err) {
+              console.error("Audio play failed", err);
+              // Force retry logic or alert user if play failed but load didn't
+              // Sometimes load is lazy, so error triggers here.
           }
       }
   };
@@ -76,188 +168,88 @@ const UI: React.FC = () => {
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (files && files.length > 0) {
-      // Cast to Blob explicitly to avoid 'unknown' argument type error in some TS environments
-      const newPhotos = Array.from(files).map((file) => URL.createObjectURL(file as Blob));
+      const newPhotos = Array.from(files).map((file: File) => URL.createObjectURL(file));
       addUploadedPhotos(newPhotos);
     }
-    // Reset input so same files can be selected again if needed
-    if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-    }
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
-
-  const getGestureText = () => {
-    switch (gestureState) {
-      case 'open-palm': return 'Open Palm';
-      case 'closed-fist': return 'Closed Fist';
-      default: return 'Waiting...';
-    }
-  };
-
-  const getPhaseContent = () => {
-    if (phase === 'tree') {
-      return {
-        title: "Tree Mode",
-        instruction: "张开手掌开启魔法",
-        subtext: "Open palm to start magic",
-        action: "OPEN"
-      };
-    }
-    return {
-      title: "Nebula Mode",
-      instruction: "五指滑动翻页 · 握拳重置",
-      subtext: "Swipe to browse · Fist to reset",
-      action: null
-    };
-  };
-
-  const content = getPhaseContent();
-  const isGestureActive = gestureState !== 'waiting';
 
   return (
     <div className="absolute inset-0 pointer-events-none p-6 flex flex-col justify-between z-10 text-white overflow-hidden font-sans">
       
-      {/* Top Left: Status & Instructions Panel */}
+      {/* Top Left: Dashboard */}
       <div className="flex flex-col gap-4 items-start pointer-events-auto">
-        <div className="group bg-slate-900/30 backdrop-blur-md border border-white/10 rounded-2xl p-5 min-w-[240px] shadow-2xl transition-all duration-300 hover:bg-slate-900/40 hover:scale-105">
-          {/* Header */}
+        <div className="bg-slate-900/40 backdrop-blur-md border border-white/10 rounded-2xl p-5 min-w-[240px] shadow-2xl">
           <div className="flex items-center justify-between mb-3">
-            <span className="text-xs font-bold tracking-widest text-slate-400 uppercase">System Status</span>
-            <div className={`flex items-center gap-2 px-2 py-0.5 rounded-full ${isGestureActive ? 'bg-green-500/20 text-green-300' : 'bg-yellow-500/20 text-yellow-300'}`}>
-               <div className={`w-1.5 h-1.5 rounded-full ${isGestureActive ? 'bg-green-400' : 'bg-yellow-400 animate-pulse'}`} />
-               <span className="text-[10px] font-bold">{isGestureActive ? 'ACTIVE' : 'IDLE'}</span>
+            <span className="text-xs font-bold tracking-widest text-slate-400 uppercase">Interactive Mode</span>
+            <div className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${gestureState !== 'waiting' ? 'bg-green-500/20 text-green-300' : 'bg-white/10 text-gray-400'}`}>
+               {gestureState === 'pinch' ? 'GRAB PHOTO' : gestureState.toUpperCase()}
             </div>
           </div>
           
-          {/* Gesture Display */}
-          <div className="text-xl font-bold text-white mb-2 font-mono tracking-tight">
-             {getGestureText()}
-          </div>
-          
-          <div className="h-px w-full bg-gradient-to-r from-white/20 to-transparent my-3" />
-          
-          {/* Instructions */}
-          <div className="space-y-1">
-             <p className="text-sm font-medium text-blue-200">{content.instruction}</p>
-             <p className="text-xs text-slate-400">{content.subtext}</p>
+          <h2 className="text-xl font-bold mb-2">
+              {theme === 'christmas' ? '🎄 Christmas' : '🏮 Spring Festival'}
+          </h2>
+          <div className="text-xs text-blue-200 mb-4">
+              {theme === 'christmas' ? 'Luxurious Gold & Red' : 'Lantern Red & Gold'}
           </div>
 
-          {/* Action Button (Tree Phase) */}
-          {content.action && (
-            <button className="mt-4 w-full py-2 bg-gradient-to-r from-amber-500 to-yellow-600 hover:from-amber-400 hover:to-yellow-500 rounded-lg text-xs font-bold text-white shadow-lg shadow-amber-500/20 active:scale-95 transition-all flex items-center justify-center gap-2 group-hover:shadow-amber-500/30">
-              <span>✨</span>
-              {content.action}
-            </button>
-          )}
-
-          {/* Upload Button */}
-          <div className="mt-3 pt-3 border-t border-white/10">
-              <input 
-                  type="file" 
-                  multiple 
-                  accept="image/*" 
-                  ref={fileInputRef} 
-                  className="hidden" 
-                  onChange={handleFileUpload} 
-              />
+          <div className="grid grid-cols-2 gap-2">
               <button 
-                  onClick={() => fileInputRef.current?.click()}
-                  className="w-full py-2 bg-gradient-to-r from-indigo-500 to-blue-600 hover:from-indigo-400 hover:to-blue-500 rounded-lg text-xs font-bold text-white shadow-lg shadow-indigo-500/20 active:scale-95 transition-all flex items-center justify-center gap-2"
+                onClick={() => setTheme('christmas')}
+                className={`py-2 rounded-lg text-xs font-bold transition-all ${theme === 'christmas' ? 'bg-amber-500 text-black' : 'bg-white/10 hover:bg-white/20'}`}
               >
-                  <span>📷</span>
-                  Upload Photos
+                  Christmas
+              </button>
+              <button 
+                onClick={() => setTheme('spring')}
+                className={`py-2 rounded-lg text-xs font-bold transition-all ${theme === 'spring' ? 'bg-red-600 text-white' : 'bg-white/10 hover:bg-white/20'}`}
+              >
+                  Festival
               </button>
           </div>
+
+          <div className="h-px w-full bg-white/10 my-4" />
+
+          <button 
+              onClick={() => fileInputRef.current?.click()}
+              className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-bold text-white transition-all flex items-center justify-center gap-2"
+          >
+              <span>📷</span> Upload Photos
+          </button>
+          <input type="file" multiple accept="image/*" ref={fileInputRef} className="hidden" onChange={handleFileUpload} />
         </div>
       </div>
 
-      {/* Center: Main Title */}
-      <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 text-center pointer-events-none">
-        <h1 className="text-7xl md:text-9xl font-bold text-transparent bg-clip-text bg-gradient-to-b from-yellow-100 via-yellow-300 to-amber-600 drop-shadow-[0_0_30px_rgba(251,191,36,0.4)] animate-pulse-slow" style={{ fontFamily: '"Brush Script MT", "cursive", serif' }}>
-          Merry Christmas
+      {/* Center Title */}
+      <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 text-center pointer-events-none mix-blend-screen">
+        <h1 className="text-6xl md:text-9xl font-bold text-transparent bg-clip-text bg-gradient-to-b from-yellow-100 via-amber-200 to-amber-600 drop-shadow-[0_0_30px_rgba(251,191,36,0.6)] animate-pulse" style={{ fontFamily: '"Brush Script MT", "cursive", serif' }}>
+          {theme === 'christmas' ? 'Merry Christmas' : 'Happy New Year'}
         </h1>
       </div>
 
-      {/* Bottom Center: Music Player */}
-      <div className="w-full flex justify-center pointer-events-auto pb-4">
-        <div className={`
-          relative bg-black/40 backdrop-blur-xl border border-white/10 rounded-full px-5 py-3 
-          flex items-center gap-5 shadow-[0_0_20px_rgba(100,100,255,0.1)] 
-          transition-all duration-500 hover:shadow-[0_0_30px_rgba(100,100,255,0.2)] hover:bg-black/50
-          ${isPlaying ? 'animate-breathing-border' : ''}
-        `}>
-          
-          {/* Rotating Icon */}
-          <div className={`
-            relative w-10 h-10 flex items-center justify-center rounded-full bg-gradient-to-br from-blue-500/20 to-purple-500/20 border border-white/10
-            ${isPlaying ? 'animate-spin-slow' : ''}
-          `}>
-             <span className="text-xl filter drop-shadow-md">❄️</span>
-          </div>
-
-          {/* Track Info */}
-          <div className="flex flex-col w-40 md:w-56 overflow-hidden">
-             <div className="text-[10px] text-blue-300 uppercase tracking-widest font-bold mb-0.5">Now Playing</div>
-             <div className="relative overflow-hidden h-6 w-full mask-linear-fade">
-               <div className={`whitespace-nowrap font-medium text-white/90 ${isPlaying ? 'animate-marquee' : ''}`}>
-                  {currentMusic} &nbsp;&nbsp; • &nbsp;&nbsp; Archive.org &nbsp;&nbsp; • &nbsp;&nbsp;
-               </div>
-             </div>
-          </div>
-
-          {/* Controls */}
-          <button 
+      {/* Bottom: Music & Status */}
+      <div className="w-full flex justify-center pointer-events-auto pb-8">
+        <button 
             onClick={toggleMusic}
-            className="w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center transition-all active:scale-90 border border-white/5 group"
-          >
-             {isPlaying ? (
-                <div className="flex gap-1 items-end h-4">
-                   <div className="w-1 bg-green-400 rounded-full animate-[music-bar_0.6s_ease-in-out_infinite] h-full" />
-                   <div className="w-1 bg-green-400 rounded-full animate-[music-bar_0.8s_ease-in-out_infinite] h-2/3" />
-                   <div className="w-1 bg-green-400 rounded-full animate-[music-bar_0.7s_ease-in-out_infinite] h-full" />
-                </div>
-             ) : (
-                <div className="w-0 h-0 border-t-[6px] border-t-transparent border-l-[10px] border-l-white border-b-[6px] border-b-transparent ml-1 opacity-80 group-hover:opacity-100" />
-             )}
-          </button>
-        </div>
+            className={`
+                flex items-center gap-4 px-6 py-3 rounded-full border transition-all duration-500
+                ${isPlaying ? 'bg-amber-500/20 border-amber-500/50 shadow-[0_0_40px_rgba(245,158,11,0.3)]' : 'bg-black/40 border-white/10 hover:bg-white/10'}
+            `}
+        >
+            <div className={`text-2xl ${isPlaying ? 'animate-spin-slow' : ''}`}>
+                {theme === 'christmas' ? '💿' : '🥁'}
+            </div>
+            <div className="flex flex-col items-start">
+                <span className="text-[10px] uppercase tracking-widest opacity-60">Background Music</span>
+                <span className="font-bold text-sm">{isPlaying ? 'Playing... (Audio Reactive)' : 'Click to Play'}</span>
+            </div>
+        </button>
       </div>
-      
-      {/* Styles for specific animations */}
+
       <style>{`
-        @keyframes marquee {
-          0% { transform: translateX(0); }
-          100% { transform: translateX(-50%); }
-        }
-        .animate-marquee {
-          display: inline-block;
-          animation: marquee 10s linear infinite;
-        }
-        @keyframes music-bar {
-           0%, 100% { height: 100%; opacity: 1; }
-           50% { height: 40%; opacity: 0.7; }
-        }
-        @keyframes spin-slow {
-           from { transform: rotate(0deg); }
-           to { transform: rotate(360deg); }
-        }
-        .animate-spin-slow {
-           animation: spin-slow 8s linear infinite;
-        }
-        @keyframes pulse-slow {
-           0%, 100% { opacity: 1; transform: scale(1); }
-           50% { opacity: 0.9; transform: scale(0.98); }
-        }
-        .animate-pulse-slow {
-           animation: pulse-slow 4s ease-in-out infinite;
-        }
-        @keyframes breathing-border {
-           0%, 100% { border-color: rgba(255,255,255,0.1); box-shadow: 0 0 20px rgba(100,100,255,0.1); }
-           50% { border-color: rgba(255,255,255,0.3); box-shadow: 0 0 30px rgba(100,100,255,0.25); }
-        }
-        .animate-breathing-border {
-           animation: breathing-border 3s ease-in-out infinite;
-        }
+        @keyframes spin-slow { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .animate-spin-slow { animation: spin-slow 8s linear infinite; }
       `}</style>
     </div>
   );

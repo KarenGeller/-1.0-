@@ -1,5 +1,5 @@
 {
-  "name": "3D Interactive Christmas Tree",
+  "name": "3D Interactive Christmas Tree(New)",
   "description": "Initial setup for a 3D interactive Christmas tree application using React Three Fiber, Zustand, and Tailwind CSS.",
   "requestFramePermissions": [
     "camera"

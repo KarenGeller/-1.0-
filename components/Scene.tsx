@@ -14,7 +14,7 @@ const Scene: React.FC = () => {
       <Suspense fallback={null}>
         {/* Camera Setup - Moved back to z=18 to fit the full height of the tree comfortably */}
         <PerspectiveCamera makeDefault position={[0, 2, 18]} fov={50} />
-        <OrbitControls enablePan={false} maxPolarAngle={Math.PI / 1.5} minPolarAngle={Math.PI / 3} />
+        <OrbitControls makeDefault enablePan={false} maxPolarAngle={Math.PI / 1.5} minPolarAngle={Math.PI / 3} />
 
         {/* Environment */}
         <color attach="background" args={['#050505']} />

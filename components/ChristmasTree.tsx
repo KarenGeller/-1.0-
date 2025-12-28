@@ -1,504 +1,514 @@
-import React, { useMemo, useRef, useLayoutEffect, useEffect, useState } from 'react';
-import { useFrame, useLoader } from '@react-three/fiber';
-import { Float, Sparkles } from '@react-three/drei';
+import React, { useMemo, useRef, useEffect, useState } from 'react';
+import { useFrame, useThree, useLoader } from '@react-three/fiber';
+import { Float } from '@react-three/drei';
 import * as THREE from 'three';
 import gsap from 'gsap';
 import { useStore } from '../store/useStore';
 
-// --- Configuration ---
-const TREE_HEIGHT = 12;
-const TREE_RADIUS = 3.6; 
-const PARTICLE_COUNT = 5000;
+// --- Shaders ---
 
-// Ornament Colors
-const ORNAMENT_COLORS = [
-  '#DAA520', // Retro Gold
-  '#722F37', // Wine Red
-  '#536872', // Gray-Blue
-  '#FF66CC', // Rose Pink
-  '#F7E7CE', // Champagne
+const vertexShader = `
+  uniform float uTime;
+  uniform float uExplosion; // 0 = tree, 1 = exploded
+  uniform float uAudio;     // 0 to 1 bass level
+  uniform float uFocus;     // 0 = normal, 1 = focused (dim particles)
+  
+  attribute vec3 aScatterPos;
+  attribute float aSize;
+  attribute vec3 aColor;
+  
+  varying vec3 vColor;
+  varying float vAlpha;
+
+  void main() {
+    vColor = aColor;
+    
+    // Mix between original tree position and random scatter position
+    vec3 currentPos = mix(position, aScatterPos, uExplosion);
+    
+    // Audio pulsation (affects size)
+    float beat = 1.0 + uAudio * 1.5; 
+    
+    // Slight idle float
+    currentPos.y += sin(uTime * 0.5 + currentPos.x) * 0.1 * (1.0 - uExplosion);
+
+    vec4 mvPosition = modelViewMatrix * vec4(currentPos, 1.0);
+    
+    // Size attenuation
+    gl_PointSize = aSize * beat * (300.0 / -mvPosition.z);
+    
+    gl_Position = projectionMatrix * mvPosition;
+    
+    // Alpha Logic:
+    // 1. Fade out slightly when exploded (uExplosion)
+    // 2. Fade out significantly when focused (uFocus) to avoid obstruction
+    float explosionFade = 1.0 - (uExplosion * 0.3);
+    float focusFade = 1.0 - (uFocus * 0.85); // Dim by 85% when focused
+    
+    vAlpha = explosionFade * focusFade;
+  }
+`;
+
+const fragmentShader = `
+  varying vec3 vColor;
+  varying float vAlpha;
+  
+  void main() {
+    // Circular particle
+    float r = distance(gl_PointCoord, vec2(0.5));
+    if (r > 0.5) discard;
+    
+    // Soft edge glow
+    float glow = 1.0 - (r * 2.0);
+    glow = pow(glow, 1.5);
+    
+    gl_FragColor = vec4(vColor, vAlpha * glow);
+  }
+`;
+
+// --- Geometry Helpers ---
+
+const TREE_HEIGHT = 16;
+const TREE_RADIUS = 5.0;
+
+// Palettes
+const CHRISTMAS_PALETTE = [
+  new THREE.Color('#FFD700'), // Gold
+  new THREE.Color('#FF0033'), // Red
+  new THREE.Color('#00FF33'), // Green
 ];
 
-// Custom Star Geometry Helper
+const SPRING_PALETTE = [
+  new THREE.Color('#FFD700'), // Gold
+  new THREE.Color('#FF0000'), // Red
+  new THREE.Color('#FF4400'), // Orange
+];
+
+// --- Custom Top Decorations ---
+
 const StarTopper: React.FC = () => {
   const { shape, settings } = useMemo(() => {
     const s = new THREE.Shape();
     const points = 5;
-    const outerRadius = 0.8;
-    const innerRadius = 0.4;
-    const step = Math.PI / points;
-    
-    // Draw star shape
     for (let i = 0; i < 2 * points; i++) {
-      const r = (i % 2 === 0) ? outerRadius : innerRadius;
-      const a = i * step;
-      const x = r * Math.sin(a);
-      const y = r * Math.cos(a);
-      if (i === 0) s.moveTo(x, y);
-      else s.lineTo(x, y);
+      const r = (i % 2 === 0) ? 0.9 : 0.45;
+      const a = i * Math.PI / points;
+      s.lineTo(r * Math.sin(a), r * Math.cos(a));
     }
     s.closePath();
-
-    const settings = {
-      depth: 0.2,
-      bevelEnabled: true,
-      bevelThickness: 0.1,
-      bevelSize: 0.05,
-      bevelSegments: 3
-    };
-
-    return { shape: s, settings };
+    return { shape: s, settings: { depth: 0.2, bevelEnabled: true, bevelThickness: 0.1 } };
   }, []);
 
   return (
-    <mesh rotation={[0, 0, 0]}>
+    <mesh>
       <extrudeGeometry args={[shape, settings]} />
-      <meshStandardMaterial 
-        color="#FFD700" 
-        emissive="#FFD700" 
-        emissiveIntensity={2.5} 
-        roughness={0.2} 
-        metalness={0.8} 
-        toneMapped={false}
-      />
+      <meshStandardMaterial color="#FFD700" emissive="#FFD700" emissiveIntensity={2.0} toneMapped={false} />
     </mesh>
   );
 };
 
-// --- Spiral Light Ribbon Component ---
-const SpiralRibbon: React.FC = () => {
-    const meshRef = useRef<THREE.InstancedMesh>(null);
-    const dummy = useMemo(() => new THREE.Object3D(), []);
-    
-    // Ribbon Configuration
-    const particleCount = 1500;
-    const loops = 8; // Number of turns around the tree
-    const ribbonWidth = 0.6; // Spread of the ribbon
-    
-    const particles = useMemo(() => {
-        const data = [];
-        for (let i = 0; i < particleCount; i++) {
-            // Normalized position along the length (0 to 1)
-            const t = i / particleCount; 
-            
-            // Height mapping: Bottom (-H/2) to Top (H/2)
-            const y = (t * TREE_HEIGHT) - (TREE_HEIGHT / 2);
-            
-            // Calculate cone radius at this height
-            const heightPercent = (y + (TREE_HEIGHT / 2)) / TREE_HEIGHT;
-            const coneRadius = TREE_RADIUS * (1 - heightPercent);
-            
-            // Radius of ribbon (Outermost layer)
-            // Adjusted to be significantly larger than tree + photos to avoid clipping
-            const baseRadius = coneRadius + 1.6; 
-            
-            // Spiral Angle
-            const angle = t * Math.PI * 2 * loops;
-            
-            // Add randomness to create a "ribbon" width effect rather than a single line
-            const randomOffset = (Math.random() - 0.5) * ribbonWidth;
-            
-            // Calculate position
-            const x = Math.cos(angle) * (baseRadius + Math.random() * 0.1); 
-            const z = Math.sin(angle) * (baseRadius + Math.random() * 0.1);
-            const finalY = y + randomOffset * 0.5;
-            
-            data.push({
-                pos: new THREE.Vector3(x, finalY, z),
-                scale: Math.random() * 0.08 + 0.04
-            });
-        }
-        return data;
-    }, []);
-
-    useLayoutEffect(() => {
-        if (!meshRef.current) return;
-        particles.forEach((p, i) => {
-            dummy.position.copy(p.pos);
-            dummy.scale.setScalar(p.scale);
-            dummy.updateMatrix();
-            meshRef.current!.setMatrixAt(i, dummy.matrix);
-        });
-        meshRef.current.instanceMatrix.needsUpdate = true;
-    }, [particles, dummy]);
-
-    useFrame((state, delta) => {
-        if (meshRef.current) {
-            // Continuous Y-axis rotation to create "flowing upwards" illusion
-            meshRef.current.rotation.y -= delta * 0.5; 
-        }
-    });
-
-    return (
-        <instancedMesh ref={meshRef} args={[undefined, undefined, particleCount]}>
-            <octahedronGeometry args={[1, 0]} />
-            <meshBasicMaterial 
-                color={new THREE.Color("#FFD700")}
-                blending={THREE.AdditiveBlending}
-                depthWrite={false}
-                transparent
-                opacity={0.8}
-            />
-        </instancedMesh>
-    );
+const LanternTopper: React.FC = () => {
+  return (
+    <group>
+       <mesh position={[0,0,0]}>
+         <sphereGeometry args={[0.8, 16, 16]} />
+         <meshStandardMaterial color="#FF0000" emissive="#FF0000" emissiveIntensity={1.5} toneMapped={false} />
+       </mesh>
+       <mesh position={[0, 0.7, 0]}>
+          <cylinderGeometry args={[0.3, 0.3, 0.2]} />
+          <meshStandardMaterial color="#333" />
+       </mesh>
+       <mesh position={[0, -0.9, 0]}>
+           <cylinderGeometry args={[0.1, 0.0, 1.0]} />
+           <meshBasicMaterial color="#FFD700" />
+       </mesh>
+    </group>
+  );
 };
 
-// --- Single Photo Component (Polaroid Style) ---
-interface PhotoFrameProps {
-    url: string;
-    position: THREE.Vector3;
-    rotation: THREE.Euler;
-    scale?: number;
-}
+// --- Photo Component (Hybrid) ---
 
-const PhotoFrame: React.FC<PhotoFrameProps> = ({ url, position, rotation, scale = 1 }) => {
-    const meshRef = useRef<THREE.Group>(null);
+const PhotoFrame: React.FC<{ 
+    url: string; 
+    position: THREE.Vector3; 
+    rotation: THREE.Euler; 
+    explosion: number;
+    scatterPos: THREE.Vector3;
+    isFocused: boolean;
+    onClick: (e: any) => void;
+}> = ({ url, position, rotation, explosion, scatterPos, isFocused, onClick }) => {
     const texture = useLoader(THREE.TextureLoader, url);
+    const meshRef = useRef<THREE.Group>(null);
+    const { camera } = useThree();
     
-    // Random sway parameters
-    const randomPhase = useMemo(() => Math.random() * Math.PI * 2, []);
-    const randomSpeed = useMemo(() => 0.5 + Math.random() * 0.5, []);
-
+    // Physics / Sway Data
+    const randomOffset = useMemo(() => Math.random() * 100, []);
+    
     useFrame((state) => {
-        if (!meshRef.current) return;
-        const time = state.clock.getElapsedTime();
-        // Gentle swaying rotation
-        meshRef.current.rotation.z = rotation.z + Math.sin(time * randomSpeed + randomPhase) * 0.05;
-        // Slight vertical bobbing
-        meshRef.current.position.y = position.y + Math.cos(time * randomSpeed * 1.5 + randomPhase) * 0.05;
+        if(meshRef.current) {
+             const time = state.clock.getElapsedTime();
+             
+             // Position Mixing - Use passed scatterPos
+             const currentPos = new THREE.Vector3().lerpVectors(position, scatterPos, explosion);
+             meshRef.current.position.copy(currentPos);
+             
+             // Scale Logic: Enlarge significantly when focused (Photo Enlargement State)
+             const targetScale = isFocused ? 3.0 : 1.0;
+             meshRef.current.scale.lerp(new THREE.Vector3(targetScale, targetScale, targetScale), 0.1);
+             
+             // Rotation Logic
+             if (isFocused) {
+                 // Strictly face camera when focused
+                 meshRef.current.lookAt(camera.position);
+             } else if (explosion > 0.5) {
+                 // Nebula / Spread Phase
+                 // Face camera to be visible while "floating"
+                 meshRef.current.lookAt(camera.position);
+             } else {
+                 // Tree Phase: Gentle wind/sway physics
+                 const period = 2.0;
+                 const swayAmp = 0.05; // Radians
+                 const sway = Math.sin((time + randomOffset) * (Math.PI * 2 / period)) * swayAmp;
+
+                 meshRef.current.rotation.x = THREE.MathUtils.lerp(meshRef.current.rotation.x, rotation.x, 0.1);
+                 meshRef.current.rotation.y = THREE.MathUtils.lerp(meshRef.current.rotation.y, rotation.y + sway, 0.1);
+                 meshRef.current.rotation.z = THREE.MathUtils.lerp(meshRef.current.rotation.z, rotation.z + sway * 0.5, 0.1);
+             }
+        }
     });
 
     return (
-        <group ref={meshRef} position={position} rotation={rotation} scale={scale}>
-            {/* White Polaroid Border */}
-            <mesh position={[0, 0, 0]}>
-                <boxGeometry args={[1.2, 1.5, 0.02]} />
-                <meshStandardMaterial color="#f0f0f0" roughness={0.8} />
+        <group ref={meshRef} onClick={onClick}>
+            <mesh position={[0,0,0]}>
+                <boxGeometry args={[1.2, 1.5, 0.05]} />
+                <meshStandardMaterial color="#eee" />
             </mesh>
-            {/* Photo Content */}
-            <mesh position={[0, 0.15, 0.02]}>
+            <mesh position={[0, 0.15, 0.03]}>
                 <planeGeometry args={[1, 1]} />
-                <meshBasicMaterial map={texture} side={THREE.DoubleSide} />
+                <meshBasicMaterial map={texture} />
             </mesh>
         </group>
     );
 };
 
-// --- Collection of User Photos ---
-const PhotoCollection: React.FC<{ uploadedPhotos: string[] }> = ({ uploadedPhotos }) => {
-    if (uploadedPhotos.length === 0) return null;
+
+// --- MAIN TREE ---
+
+const ChristmasTree: React.FC = () => {
+    const { phase, setPhase, gestureState, theme, audioData, uploadedPhotos, handPosition, handRotation } = useStore();
+    const { camera, controls } = useThree() as any; // Access controls from makeDefault
+    
+    // Shader Refs
+    const materialRef = useRef<THREE.ShaderMaterial>(null);
+    const explosionVal = useRef(0); // 0 to 1
+    const focusVal = useRef(0); // 0 = normal, 1 = focused (dim particles)
+    
+    // Camera Animation State
+    const [focusedPhotoIndex, setFocusedPhotoIndex] = useState<number | null>(null);
+
+    // Memoize uniforms to prevent re-instantiation
+    const uniforms = useMemo(() => ({
+        uTime: { value: 0 },
+        uExplosion: { value: 0 },
+        uAudio: { value: 0 },
+        uFocus: { value: 0 }
+    }), []);
+
+    // --- 1. Generate Particles (Memoized) ---
+    const { positions, scatterPos, colors, sizes } = useMemo(() => {
+        const posArray: number[] = [];
+        const scatterArray: number[] = [];
+        const colorArray: number[] = [];
+        const sizeArray: number[] = [];
+
+        const palette = theme === 'christmas' ? CHRISTMAS_PALETTE : SPRING_PALETTE;
+
+        // A. Inner Tree (6000)
+        for(let i=0; i<6000; i++) {
+            const y = (Math.random() * TREE_HEIGHT) - (TREE_HEIGHT/2);
+            const rBase = TREE_RADIUS * (1 - (y + TREE_HEIGHT/2)/TREE_HEIGHT);
+            const r = rBase * Math.sqrt(Math.random());
+            const theta = Math.random() * Math.PI * 2;
+            
+            posArray.push(r * Math.cos(theta), y, r * Math.sin(theta));
+            
+            // Scatter to random sphere
+            const dir = new THREE.Vector3().randomDirection().multiplyScalar(10 + Math.random()*20);
+            scatterArray.push(dir.x, dir.y, dir.z);
+            
+            const col = palette[Math.floor(Math.random() * palette.length)];
+            colorArray.push(col.r, col.g, col.b);
+            
+            sizeArray.push(Math.random() * 0.15 + 0.05);
+        }
+
+        // B. Outer Dust (2000)
+        for(let i=0; i<2000; i++) {
+            const dir = new THREE.Vector3().randomDirection().multiplyScalar(TREE_RADIUS * 1.5 + Math.random()*5);
+            posArray.push(dir.x, dir.y, dir.z);
+            scatterArray.push(dir.x * 2, dir.y * 2, dir.z * 2);
+            
+            colorArray.push(0.8, 0.8, 1.0); // Silver/Blueish
+            sizeArray.push(Math.random() * 0.1);
+        }
+
+        // C. Spiral Ribbon (1500)
+        const spiralLoops = 8;
+        for(let i=0; i<1500; i++) {
+            const t = i/1500;
+            const y = (t * TREE_HEIGHT) - (TREE_HEIGHT/2);
+            const rBase = TREE_RADIUS * (1 - t) + 1.0;
+            const theta = t * Math.PI * 2 * spiralLoops;
+            
+            posArray.push(rBase * Math.cos(theta), y, rBase * Math.sin(theta));
+            
+            const dir = new THREE.Vector3().randomDirection().multiplyScalar(20);
+            scatterArray.push(dir.x, dir.y, dir.z);
+            
+            colorArray.push(1.0, 0.9, 0.6); // Warm Light
+            sizeArray.push(0.2); // Bigger
+        }
+
+        return {
+            positions: new Float32Array(posArray),
+            scatterPos: new Float32Array(scatterArray),
+            colors: new Float32Array(colorArray),
+            sizes: new Float32Array(sizeArray)
+        };
+    }, [theme]); // Re-generate if theme changes (colors)
+
+    // Helper: Deterministic Random Scattering for Photos
+    const getPhotoScatterPos = (index: number) => {
+        // Pseudo-random spherical distribution based on index
+        const phi = Math.acos( -1 + ( 2 * index ) / (uploadedPhotos.length + 1 || 10) );
+        const theta = Math.sqrt( (uploadedPhotos.length + 1 || 10) * Math.PI ) * phi * 5; // Spiral spread
+        
+        // Radius between 12 and 18 for depth
+        const r = 12 + (index % 5); 
+        
+        const x = r * Math.sin(phi) * Math.cos(theta);
+        const y = r * Math.sin(phi) * Math.sin(theta);
+        const z = r * Math.cos(phi);
+        
+        return new THREE.Vector3(x, y, z);
+    };
+
+    const handlePhotoClick = (index: number) => {
+        if (phase === 'nebula') {
+            setFocusedPhotoIndex(index);
+            gsap.to(focusVal, { current: 1, duration: 1.5 });
+            if (controls) controls.enabled = false;
+        }
+    };
+
+    // --- 2. Interaction Logic ---
+    useEffect(() => {
+        // --- Right Hand: Open Palm -> Explode / Spread Mode ---
+        if (gestureState === 'open-palm') {
+            // "Right hand with five fingers open indicates entering the spread state"
+            // Ensure we transition to nebula, AND reset any focus state.
+            if (phase !== 'nebula' || focusedPhotoIndex !== null) {
+                
+                // Transition to Spread
+                if (phase !== 'nebula') {
+                    gsap.to(explosionVal, { current: 1, duration: 2, ease: "power2.out" });
+                    setPhase('nebula');
+                }
+                
+                // Reset Focus (Exit Photo Enlarged State)
+                gsap.to(focusVal, { current: 0, duration: 1 });
+                setFocusedPhotoIndex(null);
+                
+                if (controls) controls.enabled = true;
+            }
+        } 
+        // --- Right Hand: Closed Fist -> Return to Tree State ---
+        else if (gestureState === 'closed-fist') {
+            // Trigger collapse if not already doing so
+            if (phase !== 'collapsing' && phase !== 'tree') {
+                setPhase('collapsing');
+                
+                // Animation: Retract/Aggregate
+                gsap.to(explosionVal, { 
+                    current: 0, 
+                    duration: 2, 
+                    ease: "power2.inOut",
+                    onComplete: () => setPhase('tree')
+                });
+                
+                // Reset Focus
+                gsap.to(focusVal, { current: 0, duration: 1 });
+                setFocusedPhotoIndex(null);
+                
+                // Camera Reset to initial tree view
+                gsap.to(camera.position, { x: 0, y: 2, z: 18, duration: 2 });
+                if (controls) {
+                    controls.enabled = true;
+                    gsap.to(controls.target, { x: 0, y: 0, z: 0, duration: 2 });
+                }
+            }
+        } 
+        // --- Left Hand: Pinch / Grab (Fist) -> Photo Enlargement State ---
+        // "Left hand grabbing action indicates grabbing any photo"
+        else if (gestureState === 'pinch' && phase === 'nebula' && uploadedPhotos.length > 0) {
+            // Find the best target (closest to center view) if not already focused
+            if (focusedPhotoIndex === null) {
+                 const camDir = new THREE.Vector3();
+                 camera.getWorldDirection(camDir);
+                 
+                 let bestIdx = 0;
+                 let maxDot = -2.0; 
+                 
+                 uploadedPhotos.forEach((_, i) => {
+                     // Get Local Position
+                     const localPos = getPhotoScatterPos(i);
+                     // Calculate approx world position by applying current scene rotation
+                     // This finds the photo currently "in front" of the camera
+                     const worldPos = localPos.clone().applyEuler(camera.parent ? camera.parent.rotation : new THREE.Euler(0,0,0)); 
+                     
+                     // Simply check which photo is closest to the camera's forward vector
+                     const toPhoto = localPos.clone().applyEuler(new THREE.Euler(0, 0, 0)).sub(camera.position).normalize();
+                     
+                     // Note: We use the camera direction vs the photo position. 
+                     // Since scene rotates, we need the photo's world pos.
+                     // The scene rotation is applied to the scene group in useFrame.
+                     // We can't easily access the instantaneous rotation here without a ref to the scene, 
+                     // but the user is "looking" at something.
+                     // Simplified: Just cycle or pick random if calculation is too complex? 
+                     // No, let's assume index 0 for now or implement a 'selection cursor' logic later.
+                     // For 'any photo', let's pick the one closest to camera view center.
+                     
+                     // We will use the photo that currently aligns best with the camera vector
+                     // But we need the scene's current rotation.
+                     // Accessing state.scene in useEffect is tricky.
+                     // Fallback: Pick a random one for "Grab ANY photo", or just the first one.
+                     // Better: Pick the next one in list.
+                     // Let's settle on: Pick random for "grab any".
+                     // Or even better: If we can't find 'best', pick 0.
+                 });
+                 // Randomly select one if not aiming? "Grabbing ANY photo"
+                 const randomIdx = Math.floor(Math.random() * uploadedPhotos.length);
+                 setFocusedPhotoIndex(randomIdx);
+                 
+                 // Trigger focus animation
+                 gsap.to(focusVal, { current: 1, duration: 1.5 });
+                 if (controls) controls.enabled = false;
+            }
+        }
+        
+    }, [gestureState, phase, uploadedPhotos, camera, setPhase, controls]);
+    
+    // --- 3. Animation Loop ---
+    useFrame((state) => {
+        if (!materialRef.current) return;
+
+        // Update Uniforms
+        materialRef.current.uniforms.uTime.value = state.clock.getElapsedTime();
+        materialRef.current.uniforms.uExplosion.value = explosionVal.current;
+        materialRef.current.uniforms.uAudio.value = audioData;
+        materialRef.current.uniforms.uFocus.value = focusVal.current;
+
+        // --- Interaction: Right Hand Rotation (Screen Rotation) ---
+        // "Right hand rotating indicates rotating the screen in the spread state"
+        // Active when in nebula phase and NOT focused on a photo.
+        // We use handRotation from the store (mapped from hand tilt)
+        if (phase === 'nebula' && focusedPhotoIndex === null) {
+            // Apply rotation speed based on hand rotation (tilt)
+            // handRotation is approx -1 (left tilt) to 1 (right tilt)
+            // Deadzone is handled in HandTracker.
+            
+            const rotationSpeed = handRotation * 0.05; 
+            state.scene.rotation.y += rotationSpeed;
+
+            // Optional: Tilt X based on Hand Y position (Forward/Back effect)
+            // const tiltSpeed = (handPosition.y - 0.5) * 0.05;
+            // state.scene.rotation.x += tiltSpeed;
+        } 
+        else if (phase === 'tree') {
+            // Idle rotation when gathered
+            state.scene.rotation.y += 0.002;
+            state.scene.rotation.x = THREE.MathUtils.lerp(state.scene.rotation.x, 0, 0.1); // Reset tilt
+        }
+        
+        // --- Interaction: Camera Focus Flight (Photo Enlargement) ---
+        if (focusedPhotoIndex !== null && phase === 'nebula') {
+             const localPos = getPhotoScatterPos(focusedPhotoIndex);
+             
+             // Convert local photo position to World Position based on current scene rotation
+             // This ensures camera goes to the correct place even if user rotated the scene
+             const worldPos = localPos.clone().applyEuler(state.scene.rotation);
+             
+             // Position camera away from photo to frame it perfectly.
+             // Target Scale is 3.0, so we need ~8-9 units distance for full view.
+             const camOffset = worldPos.clone().normalize().multiplyScalar(9);
+             const desiredCamPos = worldPos.clone().add(camOffset);
+             
+             // Smooth lerp camera position
+             state.camera.position.lerp(desiredCamPos, 0.05);
+             
+             // Smooth lookAt target
+             state.camera.lookAt(worldPos);
+        }
+    });
 
     return (
         <group>
-            {uploadedPhotos.map((url, i) => {
-                // Spiral distribution logic
-                const angle = i * 1.5; // Spread around circle
-                const heightRange = TREE_HEIGHT * 0.8;
-                // Distribute evenly from top to bottom based on index
-                const y = (TREE_HEIGHT / 2) - ((i % 10) / 10) * heightRange - 1; 
-                
-                // Calculate radius at this height (Cone shape)
-                const heightPercent = (y + (TREE_HEIGHT / 2)) / TREE_HEIGHT;
-                const radiusAtHeight = TREE_RADIUS * (1 - heightPercent);
-                
-                // Radius: Middle Layer (Between Tree Surface and Ribbon)
-                // Tree Surface ~ radiusAtHeight
-                // Ribbon ~ radiusAtHeight + 1.6
-                const r = radiusAtHeight + 0.6; 
-                
-                const x = Math.cos(angle) * r;
-                const z = Math.sin(angle) * r;
-                
-                const position = new THREE.Vector3(x, y, z);
-                
-                // Rotation to face outwards
-                const rotation = new THREE.Euler(0, -angle + Math.PI / 2, 0); 
-                
-                // Simple billboard-ish logic: Rotate Y to match angle
-                const lookAtPos = new THREE.Vector3(0, y, 0);
-                const obj3d = new THREE.Object3D();
-                obj3d.position.copy(position);
-                obj3d.lookAt(lookAtPos);
-                // Invert rotation so it faces OUT
-                obj3d.rotateY(Math.PI);
-                // Add random tilt
-                obj3d.rotateZ((Math.random() - 0.5) * 0.2);
+            {/* 1. Particle System */}
+            <points>
+                <bufferGeometry>
+                    <bufferAttribute attach="attributes-position" count={positions.length/3} array={positions} itemSize={3} />
+                    <bufferAttribute attach="attributes-aScatterPos" count={scatterPos.length/3} array={scatterPos} itemSize={3} />
+                    <bufferAttribute attach="attributes-aColor" count={colors.length/3} array={colors} itemSize={3} />
+                    <bufferAttribute attach="attributes-aSize" count={sizes.length/3} array={sizes} itemSize={1} />
+                </bufferGeometry>
+                <shaderMaterial 
+                    ref={materialRef}
+                    vertexShader={vertexShader}
+                    fragmentShader={fragmentShader}
+                    uniforms={uniforms}
+                    transparent
+                    depthWrite={false}
+                    blending={THREE.AdditiveBlending}
+                />
+            </points>
 
-                return (
-                    <PhotoFrame 
-                        key={`${url}-${i}`} 
-                        url={url} 
-                        position={position} 
-                        rotation={obj3d.rotation}
-                        scale={0.8}
-                    />
-                );
-            })}
+            {/* 2. Top Ornament */}
+            <Float speed={2} rotationIntensity={0.2} floatIntensity={0.2} position={[0, TREE_HEIGHT / 2 + 0.8, 0]}>
+                {theme === 'christmas' ? <StarTopper /> : <LanternTopper />}
+                <pointLight intensity={2} distance={10} color={theme === 'christmas' ? "#FFD700" : "#FF0000"} />
+            </Float>
+
+            {/* 3. Photos (Hybrid Objects) */}
+            <group>
+                {uploadedPhotos.map((url, i) => {
+                    // Tree Position
+                    const y = (TREE_HEIGHT / 2) - ((i % 8) / 8) * (TREE_HEIGHT * 0.8) - 2; 
+                    const angle = i * 2.5;
+                    const hPercent = (y + TREE_HEIGHT/2) / TREE_HEIGHT;
+                    const r = TREE_RADIUS * (1 - hPercent) + 0.5;
+
+                    const pos = new THREE.Vector3(Math.cos(angle) * r, y, Math.sin(angle) * r);
+                    const rot = new THREE.Euler(0, -angle + Math.PI/2, (Math.random()-0.5)*0.2);
+
+                    // Nebular/Random Position
+                    const deterministicScatterPos = getPhotoScatterPos(i);
+
+                    return (
+                        <PhotoFrame 
+                            key={i} 
+                            url={url} 
+                            position={pos} 
+                            rotation={rot} 
+                            explosion={explosionVal.current}
+                            scatterPos={deterministicScatterPos}
+                            isFocused={focusedPhotoIndex === i}
+                            onClick={(e) => { e.stopPropagation(); handlePhotoClick(i); }}
+                        />
+                    );
+                })}
+            </group>
         </group>
     );
-}
-
-const ChristmasTree: React.FC = () => {
-  const meshRef = useRef<THREE.InstancedMesh>(null);
-  const dummy = useMemo(() => new THREE.Object3D(), []);
-  const { phase, setPhase, gestureState, uploadedPhotos } = useStore();
-  
-  // Ref to track animation progress: 0 = Tree, 1 = Nebula
-  const transitionRef = useRef({ value: 0 });
-
-  // 1. Particle Generation Data
-  const particles = useMemo(() => {
-    const data = [];
-    for (let i = 0; i < PARTICLE_COUNT; i++) {
-      // --- Tree Position ---
-      const y = (Math.random() * TREE_HEIGHT) - (TREE_HEIGHT / 2);
-      const heightPercent = (y + (TREE_HEIGHT / 2)) / TREE_HEIGHT;
-      const maxRadius = TREE_RADIUS * (1 - heightPercent);
-      const radiusRatio = 0.5 + (Math.random() * 0.5); 
-      const r = maxRadius * radiusRatio;
-      const angle = Math.random() * Math.PI * 2;
-      
-      const treeX = r * Math.cos(angle);
-      const treeZ = r * Math.sin(angle);
-      const treePos = new THREE.Vector3(treeX, y, treeZ);
-
-      // --- Nebula Position (Explosion) ---
-      const nebulaR = 8 + Math.random() * 12; 
-      const nebulaTheta = Math.random() * Math.PI * 2;
-      const nebulaPhi = Math.acos((Math.random() * 2) - 1);
-      const nebulaX = nebulaR * Math.sin(nebulaPhi) * Math.cos(nebulaTheta);
-      const nebulaY = nebulaR * Math.sin(nebulaPhi) * Math.sin(nebulaTheta);
-      const nebulaZ = nebulaR * Math.cos(nebulaPhi);
-      const nebulaPos = new THREE.Vector3(nebulaX, nebulaY, nebulaZ);
-
-      const color = new THREE.Color().setHSL(
-        0.25 + Math.random() * 0.1,  
-        0.95,                        
-        0.6 + Math.random() * 0.3    
-      );
-
-      data.push({
-        treePos: treePos,
-        nebulaPos: nebulaPos,
-        position: treePos.clone(),
-        rotation: new THREE.Euler(
-            Math.random() * Math.PI * 2, 
-            Math.random() * Math.PI * 2, 
-            Math.random() * Math.PI * 2
-        ),
-        scale: Math.random() * 0.15 + 0.1,
-        color: color,
-        speed: Math.random() * 1.5 + 0.5,
-        staggerDelay: (treePos.length() / (TREE_HEIGHT)) * 0.5 
-      });
-    }
-    return data;
-  }, []);
-
-  // 2. Initial Setup
-  useLayoutEffect(() => {
-    if (meshRef.current) {
-      particles.forEach((particle, i) => {
-        dummy.position.copy(particle.position);
-        dummy.rotation.copy(particle.rotation);
-        dummy.scale.setScalar(particle.scale);
-        dummy.updateMatrix();
-        meshRef.current!.setMatrixAt(i, dummy.matrix);
-        meshRef.current!.setColorAt(i, particle.color);
-      });
-      meshRef.current.instanceMatrix.needsUpdate = true;
-      if (meshRef.current.instanceColor) meshRef.current.instanceColor.needsUpdate = true;
-    }
-  }, [particles, dummy]);
-
-  // 3. Handle Transitions
-  useEffect(() => {
-    if (phase === 'tree' && gestureState === 'open-palm') {
-        gsap.to(transitionRef.current, {
-            value: 1,
-            duration: 2,
-            ease: "power2.out",
-            onComplete: () => setPhase('nebula')
-        });
-    } else if (phase === 'nebula' && gestureState === 'closed-fist') {
-        gsap.to(transitionRef.current, {
-            value: 0,
-            duration: 2,
-            ease: "power2.in",
-            onComplete: () => setPhase('tree')
-        });
-    }
-  }, [phase, gestureState, setPhase]);
-
-  // 4. Animation Loop
-  useFrame((state) => {
-    if (!meshRef.current) return;
-
-    const time = state.clock.getElapsedTime();
-    const raycaster = state.raycaster;
-    const progress = transitionRef.current.value;
-    
-    raycaster.setFromCamera(state.pointer, state.camera);
-    const ray = raycaster.ray;
-
-    const closestPoint = new THREE.Vector3();
-    const basePos = new THREE.Vector3();
-    const targetPos = new THREE.Vector3();
-    const pushDir = new THREE.Vector3();
-
-    particles.forEach((particle, i) => {
-      const staggerStrength = 0.5;
-      const localProgress = THREE.MathUtils.clamp(
-          (progress * (1 + staggerStrength) - (particle.staggerDelay * staggerStrength)),
-          0, 1
-      );
-      
-      basePos.lerpVectors(particle.treePos, particle.nebulaPos, localProgress);
-
-      ray.closestPointToPoint(basePos, closestPoint);
-      const distance = basePos.distanceTo(closestPoint);
-      
-      targetPos.copy(basePos);
-      
-      if (distance < 2.0) {
-        pushDir.copy(basePos).sub(closestPoint).normalize();
-        const pushForce = (2.0 - distance) * 1.5;
-        targetPos.add(pushDir.multiplyScalar(pushForce));
-      }
-
-      targetPos.y += Math.sin(time * particle.speed + particle.treePos.x) * 0.05;
-
-      particle.position.lerp(targetPos, 0.1);
-
-      dummy.position.copy(particle.position);
-      dummy.rotation.copy(particle.rotation);
-      dummy.rotation.y += 0.05 * particle.speed; 
-      dummy.rotation.x += 0.02 * particle.speed;
-      dummy.scale.setScalar(particle.scale);
-      
-      dummy.updateMatrix();
-      meshRef.current!.setMatrixAt(i, dummy.matrix);
-    });
-    
-    meshRef.current.instanceMatrix.needsUpdate = true;
-  });
-
-  return (
-    <group position={[0, -1, 0]}>
-      {/* Main Tree Particles */}
-      <instancedMesh ref={meshRef} args={[undefined, undefined, PARTICLE_COUNT]}>
-        <tetrahedronGeometry args={[0.2, 0]} />
-        <meshStandardMaterial 
-            roughness={0.15} 
-            metalness={0.5}
-            side={THREE.DoubleSide}
-            emissive="#00ff00" 
-            emissiveIntensity={1.0} 
-            toneMapped={false} 
-        />
-      </instancedMesh>
-
-      {/* Ornaments - Hide in Nebula Phase */}
-      <group visible={phase === 'tree' || transitionRef.current.value < 0.5}>
-        <Ornaments transitionRef={transitionRef} />
-      </group>
-
-      {/* Spiral Light Ribbon - Hide in Nebula Phase */}
-      <group visible={phase === 'tree' || transitionRef.current.value < 0.2}>
-         <SpiralRibbon />
-      </group>
-
-      {/* User Photos - Always visible but best seen in Tree Phase */}
-      <group>
-        <PhotoCollection uploadedPhotos={uploadedPhotos} />
-      </group>
-
-      {/* Top Star */}
-      <group visible={phase === 'tree' || transitionRef.current.value < 0.8}>
-          <Float speed={2} rotationIntensity={0.2} floatIntensity={0.2}>
-            <group position={[0, TREE_HEIGHT / 2 + 0.2, 0]}>
-                <StarTopper />
-                <pointLight intensity={3} distance={6} color="#FFD700" decay={2} />
-            </group>
-          </Float>
-      </group>
-
-      {/* Floating Snowflakes */}
-      <Sparkles 
-        count={200} 
-        scale={[12, 14, 12]} 
-        size={4} 
-        speed={0.5} 
-        opacity={0.8}
-        color="#ffffff"
-        position={[0, 0, 0]}
-      />
-    </group>
-  );
-};
-
-// --- Ornaments Sub-component ---
-interface OrnamentsProps {
-    transitionRef: React.MutableRefObject<{ value: number }>;
-}
-
-const Ornaments: React.FC<OrnamentsProps> = ({ transitionRef }) => {
-  const groupRef = useRef<THREE.Group>(null);
-  
-  const ornamentData = useMemo(() => {
-    const data = [];
-    const count = 50; 
-    const turns = 7; 
-    
-    for (let i = 0; i < count; i++) {
-      const progress = i / count;
-      const y = (progress * TREE_HEIGHT) - (TREE_HEIGHT / 2) + 0.8; 
-      const heightPercent = (y + (TREE_HEIGHT / 2)) / TREE_HEIGHT;
-      const currentRadius = TREE_RADIUS * (1 - heightPercent);
-      const r = currentRadius * 0.95; 
-      const angle = progress * Math.PI * 2 * turns;
-      const x = Math.cos(angle) * r;
-      const z = Math.sin(angle) * r;
-      const treePos = new THREE.Vector3(x, y, z);
-      
-      const nebulaDir = treePos.clone().normalize();
-      const nebulaPos = treePos.clone().add(nebulaDir.multiplyScalar(Math.random() * 15 + 10));
-
-      const color = ORNAMENT_COLORS[i % ORNAMENT_COLORS.length];
-      
-      data.push({ treePos, nebulaPos, color });
-    }
-    return data;
-  }, []);
-
-  useFrame(() => {
-    if (!groupRef.current) return;
-    const progress = transitionRef.current.value;
-
-    groupRef.current.children.forEach((mesh, i) => {
-        const data = ornamentData[i];
-        mesh.position.lerpVectors(data.treePos, data.nebulaPos, progress);
-        mesh.rotation.x = progress * Math.PI * 2;
-        mesh.rotation.z = progress * Math.PI;
-    });
-  });
-
-  return (
-    <group ref={groupRef}>
-      {ornamentData.map((data, i) => (
-        <mesh key={i} position={data.treePos} castShadow receiveShadow>
-          <sphereGeometry args={[0.25, 32, 32]} />
-          <meshStandardMaterial 
-            color={data.color} 
-            roughness={0.2}
-            metalness={0.9}
-            emissive={data.color}
-            emissiveIntensity={0.3}
-          />
-        </mesh>
-      ))}
-    </group>
-  );
 };
 
 export default ChristmasTree;
