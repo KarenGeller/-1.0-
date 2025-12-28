@@ -4,6 +4,30 @@ import { Stars, PerspectiveCamera, OrbitControls } from '@react-three/drei';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import ChristmasTree from './ChristmasTree';
 
+// Extend React's JSX namespace
+declare module 'react' {
+  namespace JSX {
+    interface IntrinsicElements {
+      color: any;
+      pointLight: any;
+      ambientLight: any;
+      primitive: any;
+    }
+  }
+}
+
+// Fallback for global JSX
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      color: any;
+      pointLight: any;
+      ambientLight: any;
+      primitive: any;
+    }
+  }
+}
+
 const Scene: React.FC = () => {
   return (
     <Canvas

@@ -5,6 +5,29 @@ import * as THREE from 'three';
 import gsap from 'gsap';
 import { useStore } from '../store/useStore';
 
+// Global JSX namespace augmentation for React Three Fiber elements
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      group: any;
+      mesh: any;
+      points: any;
+      pointLight: any;
+      ambientLight: any;
+      bufferGeometry: any;
+      bufferAttribute: any;
+      boxGeometry: any;
+      sphereGeometry: any;
+      planeGeometry: any;
+      cylinderGeometry: any;
+      extrudeGeometry: any;
+      meshStandardMaterial: any;
+      meshBasicMaterial: any;
+      shaderMaterial: any;
+    }
+  }
+}
+
 // --- Shaders ---
 
 const vertexShader = `
@@ -368,23 +391,6 @@ const ChristmasTree: React.FC = () => {
                      
                      // Simply check which photo is closest to the camera's forward vector
                      const toPhoto = localPos.clone().applyEuler(new THREE.Euler(0, 0, 0)).sub(camera.position).normalize();
-                     
-                     // Note: We use the camera direction vs the photo position. 
-                     // Since scene rotates, we need the photo's world pos.
-                     // The scene rotation is applied to the scene group in useFrame.
-                     // We can't easily access the instantaneous rotation here without a ref to the scene, 
-                     // but the user is "looking" at something.
-                     // Simplified: Just cycle or pick random if calculation is too complex? 
-                     // No, let's assume index 0 for now or implement a 'selection cursor' logic later.
-                     // For 'any photo', let's pick the one closest to camera view center.
-                     
-                     // We will use the photo that currently aligns best with the camera vector
-                     // But we need the scene's current rotation.
-                     // Accessing state.scene in useEffect is tricky.
-                     // Fallback: Pick a random one for "Grab ANY photo", or just the first one.
-                     // Better: Pick the next one in list.
-                     // Let's settle on: Pick random for "grab any".
-                     // Or even better: If we can't find 'best', pick 0.
                  });
                  // Randomly select one if not aiming? "Grabbing ANY photo"
                  const randomIdx = Math.floor(Math.random() * uploadedPhotos.length);
